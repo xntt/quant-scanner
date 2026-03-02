@@ -55,17 +55,18 @@ def fetch_sina_data(symbol):
         return None
 
 # ==========================================
-# 4. 核心策略：慢牛扫地僧算法
+# 4. 核心策略：慢牛扫地僧算法 (已修复 KeyError)
 # ==========================================
 def check_stealth_bull(df, max_dist):
     """判断单只股票是否符合量化形态"""
     if df is None or len(df) < 120:
         return False, None
     
-    # 1. 计算均线
+    # 1. 必须在最开始计算好所有需要的列（均线、涨跌幅）
     df['MA20'] = df['close'].rolling(window=20).mean()
     df['MA60'] = df['close'].rolling(window=60).mean()
     df['MA120'] = df['close'].rolling(window=120).mean()
+    df['pct_change'] = df['close'].pct_change()  # <--- 修复点：移到切片之前计算
     
     current = df.iloc[-1]
     prev = df.iloc[-2]
@@ -76,15 +77,15 @@ def check_stealth_bull(df, max_dist):
     if not (current['MA60'] > prev['MA60']):
         return False, None
         
-    # 条件B：碎步小阳，拒绝暴涨 (近15天阳线>=9天，近20天涨幅超6%的日子<=2)
+    # 2. 所有列计算完毕后，再进行数据切片
     last_15 = df.tail(15)
     last_20 = df.tail(20)
     
+    # 条件B：碎步小阳，拒绝暴涨 (近15天阳线>=9天，近20天涨幅超6%的日子<=2)
     positive_days = len(last_15[last_15['close'] > last_15['open']])
     if positive_days < 9: # 至少9天是红盘
         return False, None
         
-    df['pct_change'] = df['close'].pct_change()
     pump_days = len(last_20[last_20['pct_change'] > 0.06])
     if pump_days > 2: # 拒绝游资拉升
         return False, None
