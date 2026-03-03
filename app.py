@@ -10,15 +10,23 @@ from plotly.subplots import make_subplots
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==========================================
-# 1. 全局页面配置 & 状态管理 (记忆功能)
+# 1. 全局页面配置 & 状态管理 (修复缓存报错)
 # ==========================================
 st.set_page_config(page_title="A股全天候量化武器库", page_icon="⚔️", layout="wide")
 
-# 初始化 Session State 以保存各个模式的扫描结果，保证切换不丢失
+# 强制安全初始化：兼容旧版本缓存，确保所有模式的 key 都绝对存在
 if 'results' not in st.session_state:
-    st.session_state['results'] = {'bull': None, 'hot': None, 'quant': None, 'resonance': None, 'monster': None}
+    st.session_state['results'] = {}
 if 'history' not in st.session_state:
-    st.session_state['history'] = {'bull': {}, 'hot': {}, 'quant': {}, 'resonance': {}, 'monster': {}}
+    st.session_state['history'] = {}
+
+# 定义所有模块的标识符
+app_modes_keys = ['bull', 'hot', 'quant', 'resonance', 'monster']
+for key in app_modes_keys:
+    if key not in st.session_state['results']:
+        st.session_state['results'][key] = None
+    if key not in st.session_state['history']:
+        st.session_state['history'][key] = {}
 
 # ==========================================
 # 2. 侧边栏：主导航菜单
