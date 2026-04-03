@@ -3,4 +3,4 @@ pandas
 requests
 pandas-ta
 plotly
-numpy
+
