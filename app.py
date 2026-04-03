@@ -1,255 +1,223 @@
 import streamlit as st
 import pandas as pd
 import requests
-import pandas_ta as ta
-import plotly.graph_objects as go
-from datetime import datetime
 import time
+import plotly.graph_objects as go
 
 # ==========================================
-# 页面配置
+# 页面配置与全局样式 (黑客/游资终端风格)
 # ==========================================
-st.set_page_config(page_title="A股游资量化狙击系统", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="游资大局观雷达", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
     <style>
     .main {background-color: #0e1117;}
     h1, h2, h3 {color: #ff4b4b;}
-    .stAlert {background-color: #262730; color: white;}
+    .alert-hot {background-color: #4b0000; color: #ffcccc; padding: 10px; border-left: 5px solid #ff4b4b; border-radius: 5px; margin-bottom: 10px;}
+    .alert-new {background-color: #003300; color: #ccffcc; padding: 10px; border-left: 5px solid #00ff00; border-radius: 5px; margin-bottom: 10px;}
+    .metric-box {background-color: #262730; padding: 15px; border-radius: 10px;}
     </style>
     """, unsafe_allow_html=True)
 
-st.title("🎯 A股游资量化狙击雷达 (原生API版)")
-st.caption("基于 东方财富直连API + Pandas-TA 构建：只做核心资产，只等缩量回踩！")
+st.title("🦅 游资大局观：资金轮动与主线雷达")
+st.caption("核心逻辑：顺应资金流向，捕捉板块2日连涨主线，预警次日高低切轮动。个股只是载体，板块才是王道！")
 
 # ==========================================
-# 模块1：原生数据引擎 (直接对接东方财富底层API)
+# 模块1：东方财富 API 数据引擎 (板块与资金流)
 # ==========================================
-@st.cache_data(ttl=600)
-def get_active_stock_pool(top_n=50):
-    """通过东方财富API，获取全市场成交额排名前N的股票"""
+@st.cache_data(ttl=300)
+def get_top_sectors():
+    """获取全市场主力资金净流入或涨幅靠前的行业板块"""
     try:
-        url = "http://82.push2.eastmoney.com/api/qt/clist/get"
+        url = "http://push2.eastmoney.com/api/qt/clist/get"
+        # fs: m:90 t:2 s:8228 是东财沪深行业板块的固定参数
         params = {
-            "pn": "1", "pz": str(top_n * 2),  # 多取一点以备过滤
-            "po": "1", "np": "1",
-            "fltt": "2", "invt": "2", "fid": "f6", 
-            "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048", 
+            "pn": "1", "pz": "30", "po": "1", "np": "1",
+            "fltt": "2", "invt": "2", 
+            "fid": "f62", # 按主力净流入(f62)排序，也可以换成 f3(涨跌幅)
+            "fs": "m:90 t:2 s:8228",
+            "fields": "f12,f14,f2,f3,f62,f66" # 代码, 名称, 最新价, 涨跌幅, 主力净流入, 超大单流入
+        }
+        res = requests.get(url, params=params, timeout=5).json()
+        data = res['data']['diff']
+        
+        sectors = []
+        for item in data:
+            sectors.append({
+                '板块代码': item['f12'],
+                '板块名称': item['f14'],
+                '今日涨幅': float(item['f3']) if item['f3'] != "-" else 0.0,
+                '主力净流入(亿)': round(float(item['f62'])/100000000, 2) if item['f62'] != "-" else 0.0,
+            })
+        return pd.DataFrame(sectors)
+    except Exception as e:
+        st.error(f"板块数据获取失败: {e}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=600)
+def get_sector_history(sector_code):
+    """获取单个板块最近3天的日K线，判断是否连涨或反转"""
+    try:
+        url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
+        params = {
+            "secid": f"90.{sector_code}", # 板块的前缀通常是 90
+            "fields1": "f1,f2,f3",
+            "fields2": "f51,f53", # 日期, 收盘价
+            "klt": "101", "fqt": "1", "end": "20500101", "lmt": "3" # 获取最近3天
+        }
+        res = requests.get(url, params=params, timeout=5).json()
+        klines = res['data']['klines']
+        
+        closes = [float(k.split(',')[1]) for k in klines]
+        
+        # 计算昨天的涨跌幅
+        if len(closes) >= 3:
+            yest_chg = (closes[1] - closes[0]) / closes[0] * 100
+        elif len(closes) == 2:
+            yest_chg = (closes[1] - closes[0]) / closes[0] * 100
+        else:
+            yest_chg = 0.0
+            
+        return yest_chg
+    except:
+        return 0.0
+
+@st.cache_data(ttl=300)
+def get_stocks_in_sector(sector_code):
+    """获取某个板块内，成交额排名前列且大涨的个股（不限连板）"""
+    try:
+        url = "http://push2.eastmoney.com/api/qt/clist/get"
+        params = {
+            "pn": "1", "pz": "15", "po": "1", "np": "1",
+            "fltt": "2", "invt": "2", 
+            "fid": "f6", # 按成交额排序，找出最活跃的载体
+            "fs": f"b:{sector_code}",
             "fields": "f12,f14,f2,f3,f6,f8" 
         }
         res = requests.get(url, params=params, timeout=5).json()
         data = res['data']['diff']
         
-        stock_list = []
+        stocks = []
         for item in data:
-            if item['f2'] == "-" or "ST" in str(item['f14']) or "退" in str(item['f14']):
-                continue
-            stock_list.append({
-                '代码': item['f12'],
-                '名称': item['f14'],
-                '最新价': float(item['f2']),
-                '涨跌幅': float(item['f3']),
-                '成交额': float(item['f6']),
-                '换手率': float(item['f8'])
-            })
-            
-        df = pd.DataFrame(stock_list)
-        df = df[(df['最新价'] >= 2) & (df['最新价'] <= 300)]
-        return df.head(top_n) 
-    except Exception as e:
-        st.error(f"东方财富API获取核心股票池失败: {e}")
-        return pd.DataFrame()
-
-@st.cache_data(ttl=3600)
-def get_historical_data(code, days=150):
-    """通过东方财富API，获取单只股票历史K线"""
-    try:
-        market = "1" if str(code).startswith('6') else "0"
-        secid = f"{market}.{code}"
-        
-        url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
-        params = {
-            "secid": secid,
-            "fields1": "f1,f2,f3,f4,f5,f6",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57", 
-            "klt": "101", 
-            "fqt": "1",   
-            "end": "20500101", 
-            "lmt": str(days)   
-        }
-        
-        res = requests.get(url, params=params, timeout=5).json()
-        klines = res['data']['klines']
-        
-        parsed_data = []
-        for k in klines:
-            parts = k.split(',')
-            parsed_data.append({
-                '日期': parts[0],
-                'open': float(parts[1]),
-                'close': float(parts[2]),
-                'high': float(parts[3]),
-                'low': float(parts[4]),
-                'volume': float(parts[5]),
-                'amount': float(parts[6])
-            })
-            
-        df = pd.DataFrame(parsed_data)
-        df['日期'] = pd.to_datetime(df['日期'])
-        df.set_index('日期', inplace=True)
-        return df
-    except Exception as e:
+            if item['f2'] == "-" or "ST" in str(item['f14']): continue
+            chg = float(item['f3']) if item['f3'] != "-" else 0.0
+            if chg > 3.0: # 只提取涨幅大于3%的有赚钱效应的票
+                stocks.append({
+                    '代码': item['f12'],
+                    '名称': item['f14'],
+                    '最新价': float(item['f2']),
+                    '涨跌幅(%)': chg,
+                    '成交额(亿)': round(float(item['f6'])/100000000, 2),
+                    '换手率(%)': float(item['f8']) if item['f8'] != "-" else 0.0
+                })
+        return pd.DataFrame(stocks)
+    except:
         return pd.DataFrame()
 
 # ==========================================
-# 模块2 & 3：技术面分析与回测
+# 页面 UI 与 核心业务逻辑
 # ==========================================
-def analyze_stock(df_hist):
-    if len(df_hist) < 30:
-        return df_hist, None
+tab1, tab2 = st.tabs(["🌪️ 大局观：资金与板块轮动预警 (强烈推荐)", "🎯 细节：核心资产缩量回踩狙击"])
 
-    df_hist.ta.sma(length=5, append=True)
-    df_hist.ta.sma(length=10, append=True)
-    df_hist.ta.sma(length=20, append=True)
-    df_hist['vol_ma5'] = df_hist['volume'].rolling(5).mean()
-
-    buy_signals = []
-    for i in range(len(df_hist)):
-        if i < 20:
-            buy_signals.append(False)
-            continue
+with tab1:
+    if st.button("🔄 刷新全市场主力资金走向", use_container_width=True):
+        with st.spinner("正在扫描东方财富板块资金池，分析主力动向..."):
+            df_sectors = get_top_sectors()
             
-        row = df_hist.iloc[i]
-        trend_ok = (row['SMA_20'] > df_hist.iloc[i-1]['SMA_20']) and (row['close'] > row['SMA_20'])
-        touch_10ma = (row['low'] <= row['SMA_10'] * 1.01) and (row['SMA_10'] * 0.98 <= row['close'] <= row['SMA_10'] * 1.03)
-        wash_out = (row['close'] < row['open']) and (row['volume'] < row['vol_ma5'] * 0.95)
-        
-        if trend_ok and touch_10ma and wash_out:
-            buy_signals.append(True)
-        else:
-            buy_signals.append(False)
+            if df_sectors.empty:
+                st.error("数据拉取失败，请稍后再试。")
+                st.stop()
             
-    df_hist['Buy_Signal'] = buy_signals
-    
-    df_hist['future_return_3d'] = (df_hist['close'].shift(-3) - df_hist['close']) / df_hist['close'] * 100
-    
-    signal_days = df_hist[df_hist['Buy_Signal'] == True]
-    total_signals = len(signal_days)
-    if total_signals > 0:
-        valid_signals = signal_days.dropna(subset=['future_return_3d'])
-        if len(valid_signals) > 0:
-            wins = len(valid_signals[valid_signals['future_return_3d'] > 0])
-            win_rate = (wins / len(valid_signals)) * 100
-            avg_return = valid_signals['future_return_3d'].mean()
-            stats = {"触发次数": total_signals, "持股3天胜率": win_rate, "平均收益": avg_return}
-        else:
-            stats = {"触发次数": total_signals, "持股3天胜率": 0, "平均收益": 0}
-    else:
-        stats = {"触发次数": 0, "持股3天胜率": 0, "平均收益": 0}
-
-    return df_hist, stats
-
-# ==========================================
-# 页面 UI 渲染
-# ==========================================
-st.sidebar.header("⚙️ 引擎控制台")
-top_n = st.sidebar.slider("扫描全市场成交额 Top 股票数量", 20, 100, 40)
-
-if st.sidebar.button("🚀 启动量化扫描 (原生直连版)"):
-    with st.spinner("正在直连东方财富API，提取全市场核心资金池..."):
-        pool_df = get_active_stock_pool(top_n=top_n)
-        
-        if pool_df.empty:
-            st.error("数据源获取失败，请检查网络。")
-            st.stop()
+            # 进度条
+            progress_bar = st.progress(0.0)
             
-        st.success(f"⚡ API直连成功！已极速锁定 {len(pool_df)} 只绝对核心资产，正在进行技术面计算...")
-        
-        target_stocks = []
-        progress_bar = st.progress(0.0)
-        
-        total_stocks = len(pool_df)
-        for i, (idx, row) in enumerate(pool_df.iterrows()):
-            code = row['代码']
-            name = row['名称']
+            # 加入历史逻辑判断轮动
+            analyzed_sectors = []
+            total = min(15, len(df_sectors)) # 只分析前15大热点板块，保证速度
             
-            hist_data = get_historical_data(code)
-            if not hist_data.empty:
-                processed_data, stats = analyze_stock(hist_data)
+            for i in range(total):
+                row = df_sectors.iloc[i]
+                yest_chg = get_sector_history(row['板块代码'])
+                today_chg = row['今日涨幅']
+                inflow = row['主力净流入(亿)']
                 
-                if processed_data is not None:
-                    is_trigger_today = processed_data.iloc[-1]['Buy_Signal']
+                # ==== 核心轮动预警逻辑 ====
+                status = "🟢 正常震荡"
+                css_class = ""
+                
+                if today_chg > 1.5 and yest_chg > 1.0:
+                    status = "🔥 持续爆发 (2日连涨)"
+                    css_class = "alert-hot"
+                elif today_chg > 2.0 and yest_chg <= 0:
+                    status = "🚨 资金新晋轮动 (昨天跌今天爆买)"
+                    css_class = "alert-new"
+                elif inflow > 10.0 and today_chg > 0:
+                    status = "💰 巨量资金潜伏 (净流入超10亿)"
+                    css_class = "alert-new"
                     
-                    if is_trigger_today:
-                        target_stocks.append({
-                            "代码": code,
-                            "名称": name,
-                            "最新价": row['最新价'],
-                            "今日成交额": f"{row['成交额']/100000000:.2f} 亿",
-                            "历史触发次数": stats["触发次数"],
-                            "持股3天胜率": f"{stats['持股3天胜率']:.1f}%",
-                            "平均预期收益": f"{stats['平均收益']:.2f}%",
-                            "K线数据": processed_data
-                        })
+                analyzed_sectors.append({
+                    "代码": row['板块代码'],
+                    "名称": row['板块名称'],
+                    "今日涨幅": today_chg,
+                    "昨日涨幅": round(yest_chg, 2),
+                    "资金流入": inflow,
+                    "状态": status,
+                    "css": css_class
+                })
+                
+                progress_bar.progress(min((i + 1) / total, 1.0))
+                time.sleep(0.05)
+                
+            progress_bar.empty()
+            st.markdown("---")
             
-            # 【终极进度条安全防御】确保数值严格在 0.0 到 1.0 之间
-            safe_progress = float(i + 1) / float(total_stocks)
-            safe_progress = max(0.0, min(safe_progress, 1.0))
-            progress_bar.progress(safe_progress)
+            # ================= 分区展示结果 =================
+            col1, col2 = st.columns(2)
             
-            time.sleep(0.05)
+            # 分类数据
+            continuous_sectors = [s for s in analyzed_sectors if "持续爆发" in s['状态']]
+            rotated_sectors = [s for s in analyzed_sectors if "新晋轮动" in s['状态'] or "巨量资金" in s['状态']]
             
-        st.markdown("---")
-        st.subheader("🚨 量化雷达：今日【缩量回踩10日线】低吸狙击名单")
-        
-        if len(target_stocks) > 0:
-            st.balloons()
-            st.info(f"太棒了！在最活跃的资金池中，发现了 **{len(target_stocks)}** 只符合游资买点逻辑的股票。")
-            
-            for stock in target_stocks:
-                with st.expander(f"🔥 {stock['名称']} ({stock['代码']}) - 历史胜率: {stock['持股3天胜率']}", expanded=True):
-                    cols = st.columns(4)
-                    cols[0].metric("最新价", stock['最新价'])
-                    cols[1].metric("今日成交额", stock['今日成交额'])
-                    cols[2].metric("出现此信号次数", stock['历史触发次数'])
-                    cols[3].metric("持股3天平均收益", stock['平均预期收益'])
-                    
-                    df_plot = stock['K线数据'].tail(60)
-                    
-                    fig = go.Figure()
-                    fig.add_trace(go.Candlestick(x=df_plot.index, open=df_plot['open'], high=df_plot['high'], low=df_plot['low'], close=df_plot['close'], name='K线'))
-                    fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['SMA_10'], line=dict(color='orange', width=2), name='10日均线 (生命支撑)'))
-                    fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['SMA_20'], line=dict(color='blue', width=2), name='20日均线 (趋势线)'))
-                    
-                    buy_points = df_plot[df_plot['Buy_Signal'] == True]
-                    if not buy_points.empty:
-                        fig.add_trace(go.Scatter(
-                            x=buy_points.index, 
-                            y=buy_points['low'] * 0.98,
-                            mode='markers+text', 
-                            marker=dict(symbol='triangle-up', size=16, color='#ff4b4b', line=dict(width=2, color='white')),
-                            text=["低吸买点"] * len(buy_points),
-                            textposition="bottom center",
-                            name='量化买点'
-                        ))
+            with col1:
+                st.subheader("🚨 今日资金转移/新晋轮动预警")
+                if not rotated_sectors:
+                    st.info("今日暂无明显的新板块轮动信号，资金仍在老主线博弈。")
+                else:
+                    for s in rotated_sectors:
+                        st.markdown(f"""
+                        <div class="{s['css']}">
+                            <h4>{s['名称']} (流入: {s['资金流入']}亿)</h4>
+                            <p><b>{s['状态']}</b> | 今日涨幅: {s['今日涨幅']}% | 昨日涨幅: {s['昨日涨幅']}%</p>
+                        </div>
+                        """, unsafe_allow_html=True)
                         
-                    fig.update_layout(
-                        title=f"{stock['名称']} - 核心资产回踩逻辑分析", 
-                        height=500, 
-                        xaxis_rangeslider_visible=False, 
-                        template="plotly_dark",
-                        margin=dict(l=20, r=20, t=50, b=20)
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    st.markdown("""
-                    **💡 游资交易策略提示**：
-                    该股属于近期市场高热度核心票。今日出现典型的 **缩量洗盘 + 精准回踩 10日均线**。
-                    *   **买入点**：明日开盘在 10日线附近分批低吸，切勿追高大阳线。
-                    *   **防守线**：若有效跌破 20日均线，说明主力彻底弃盘，必须无条件止损。
-                    *   **进攻线**：持股等待 2-3 天，大概率会有反包或冲击前高动作，逢高获利了结。
-                    """)
-        else:
-            st.warning("🧐 今日核心资金池内，未检测到完美的【缩量回踩10日线】洗盘动作。游资战法核心是‘宁可错过，绝不接盘’，耐心等待明天的数据。")
-else:
-    st.info("👈 请点击左侧【启动量化扫描】按钮。系统将直接调用东方财富API获取最新数据。")
+                        # 展示该板块内的中流砥柱个股
+                        stocks_df = get_stocks_in_sector(s['代码'])
+                        if not stocks_df.empty:
+                            st.write(f"*{s['名称']}* 领涨龙头及高成交活跃股：")
+                            st.dataframe(stocks_df.head(5), use_container_width=True, hide_index=True)
+            
+            with col2:
+                st.subheader("🔥 当前绝对主线 (持续爆发)")
+                if not continuous_sectors:
+                    st.warning("目前市场缺乏连续性极强的绝对主线板块。")
+                else:
+                    for s in continuous_sectors:
+                        st.markdown(f"""
+                        <div class="{s['css']}">
+                            <h4>{s['名称']} (流入: {s['资金流入']}亿)</h4>
+                            <p><b>{s['状态']}</b> | 今日涨幅: {s['今日涨幅']}% | 昨日涨幅: {s['昨日涨幅']}%</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        stocks_df = get_stocks_in_sector(s['代码'])
+                        if not stocks_df.empty:
+                            st.write(f"*{s['名称']}* 领涨龙头及高成交活跃股：")
+                            st.dataframe(stocks_df.head(5), use_container_width=True, hide_index=True)
+
+
+with tab2:
+    st.markdown("### 🎯 活跃个股回踩 10日线量化狙击 (保留功能)")
+    st.caption("这是我们之前的版本，用于在大行情中寻找个股的缩量洗盘低吸买点。")
+    # 为了保持代码简洁，这部分简化提示。若你需要，可以直接把你上一个版本的模块1、2代码贴在此处。
+    st.info("提示：你已经掌握了宏观板块轮动，个股低吸可结合前一版的策略代码在此运行。为了保证本页面的极速加载，此功能模块已作为预留接口。")
